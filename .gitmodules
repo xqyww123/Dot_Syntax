@@ -1,0 +1,10 @@
+[submodule "worktrees/Isabelle2025-2-dot_syntax"]
+	path = worktrees/Isabelle2025-2-dot_syntax
+	url = https://github.com/xqyww123/isabelle-patched.git
+	branch = Isabelle2025-2/dot_syntax
+	base = Isabelle2025-2/local_datatype
+	ignore = all
+[submodule "worktrees/Isabelle2025-2-dot_syntax-stock"]
+	path = worktrees/Isabelle2025-2-dot_syntax-stock
+	url = https://github.com/xqyww123/isabelle-patched.git
+	ignore = all

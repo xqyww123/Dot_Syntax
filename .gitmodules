@@ -8,3 +8,13 @@
 	path = worktrees/Isabelle2025-2-dot_syntax-stock
 	url = https://github.com/xqyww123/isabelle-patched.git
 	ignore = all
+[submodule "worktrees/Isabelle2026-dot_syntax"]
+	path = worktrees/Isabelle2026-dot_syntax
+	url = https://github.com/xqyww123/isabelle-patched.git
+	branch = Isabelle2026/dot_syntax
+	base = Isabelle2026/local_datatype
+	ignore = all
+[submodule "worktrees/Isabelle2026-dot_syntax-stock"]
+	path = worktrees/Isabelle2026-dot_syntax-stock
+	url = https://github.com/xqyww123/isabelle-patched.git
+	ignore = all

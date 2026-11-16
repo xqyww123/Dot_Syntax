@@ -1133,7 +1133,7 @@ fun occurrences_of Ts =
 (*a unification that fails on a blocked variable: no step commits on a waiting result.  The
   equation A = B is opened: every occurrence of a blocked variable becomes its own fresh
   parameter (a wildcard), so that nothing passes through a waiting result from one occurrence to
-  another.  A parameter of step that the unifier links to a wildcard depends on a waiting
+  another.  A parameter of step whose binding chain meets a wildcard's depends on a waiting
   result: it is opened as well, until no new one occurs twice in the equation, and is then
   frozen to a blocked variable of the sort the unifier gives it.  SOME: the rest of the unifier,
   read through the frozen parameters; NONE: the opened types do not unify either.  Wildcards are
@@ -1174,13 +1174,14 @@ fun opened_unify ctxt (A, B) step start tye =
               val on_chain =
                 Inttab.fold (fn (i, _) => chain (Type_Infer.param i ("'_dotwild", [])))
                   origin [];
+              (*the binding chain meets a wildcard's: at the wildcard, or at a parameter on its
+                chain (as the one that meet puts in the place of a wildcard of a weaker sort)*)
               fun to_wild (A as TVar (xi, _)) =
-                    is_wild A orelse
+                    is_wild A orelse member (op =) on_chain xi orelse
                       (case Vartab.lookup tye1 xi of SOME B => to_wild B | NONE => false)
                 | to_wild _ = false;
               val new = step |> filter (fn (xi, S) =>
-                not (AList.defined (op =) D xi) andalso
-                  (member (op =) on_chain xi orelse to_wild (TVar (xi, S))));
+                not (AList.defined (op =) D xi) andalso to_wild (TVar (xi, S)));
               (*the sort that the unifier gives a parameter*)
               fun sort_in (xi, S) =
                 (case Type_Infer.deref tye1 (TVar (xi, S)) of TVar (_, S') => S' | _ => S);

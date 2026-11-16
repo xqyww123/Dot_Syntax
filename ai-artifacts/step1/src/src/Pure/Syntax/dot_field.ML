@@ -46,15 +46,14 @@ sig
   val defined: Proof.context -> string -> bool
   val unifier: theory -> {rigid: indexname -> bool} -> typ -> typ -> (Type.tyenv * int) option
   val fits: theory -> {rigid: indexname -> bool} -> typ -> typ -> bool
-  val candidates: Proof.context -> {rigid: indexname -> bool} -> string -> typ ->
-    registration list
+  val candidates: Proof.context -> {rigid: indexname -> bool} -> string -> typ -> term list
   val field_names: Proof.context -> {rigid: indexname -> bool} -> typ -> string list
   val declaration: {add: bool, pos: Position.T} -> (string * term) list -> Morphism.declaration
   val register_constants: string list -> Context.generic -> Context.generic
   val read_registration: Proof.context -> string * Input.source -> term
   val check_registration: Proof.context -> string * term -> string * term
-  datatype conflict = Same_Pattern | New_Never | Old_Never | Overlap
-  val conflicts: Proof.context -> string * term -> (conflict * registration) list
+  datatype conflict = Same_Pattern | Overlap of typ
+  val conflicts: Proof.context -> string * term -> (conflict * term) list
   val report_conflicts: Proof.context -> string * term -> unit
   type site = {args: int, types: typ list}
   type occurrence = {name: string, const: string, pos: Position.T, site: site}
@@ -377,7 +376,9 @@ fun const_prefix ctxt min segs =
   registration this copy was made from; global: added to a theory, not to a proof context*)
 type registration = {field: string, term: term, serial: serial, global: bool, pos: Position.T};
 
-fun pattern_of ({term, ...}: registration) = domain_type (fastype_of term);
+(*the pattern type of a registered term: the type of the object*)
+fun pattern t = domain_type (fastype_of t);
+fun pattern_of ({term, ...}: registration) = pattern term;
 
 fun key_of field T = Const (field, dummyT) $ Net.encode_type T;
 
@@ -411,15 +412,20 @@ fun identical_terms thy (t, u) =
 fun identical thy (r1: registration, r2: registration) =
   #field r1 = #field r2 andalso identical_terms thy (#term r1, #term r2);
 
-(*drop a candidate that is a type instance of another one; of identical ones keep the first
-  (registry order: newest first)*)
-fun subsume thy =
+(*drop a registered term that is a type instance of another one; of identical ones keep the
+  first (registry order: newest first).  A type instance is the same term up to its types, so
+  only such terms are compared: linear in the terms unless they differ in their types only*)
+fun subsume thy ts =
   let
-    fun inst (r: registration, r': registration) = term_instance thy (#term r, #term r');
-    fun add r kept =
-      if exists (fn r' => inst (r, r')) kept then kept
-      else filter_out (fn r' => inst (r', r)) kept @ [r];
-  in fn rs => fold add rs [] end;
+    val untyped = Term.map_types (K dummyT) o Envir.beta_eta_contract;
+    val uts = map_index (fn (i, t) => (untyped t, (i, t))) ts;
+    val groups = fold_rev Termtab.cons_list uts Termtab.empty;
+    fun dropped (u, (i, t)) =
+      exists (fn (j, t') =>
+          i <> j andalso term_instance thy (t, t') andalso
+          (j < i orelse not (term_instance thy (t', t))))
+        (Termtab.lookup_list groups u);
+  in map_filter (fn ut => if dropped ut then NONE else SOME (#2 (#2 ut))) uts end;
 
 
 (* visible registrations *)
@@ -469,10 +475,14 @@ fun unifier thy {rigid} T P =
 
 fun fits thy rigid T P = is_some (unifier thy rigid T P);
 
+(*T is an instance of the pattern P*)
+fun matches thy = fits thy {rigid = K true};
+
+(*the registered terms of the candidates*)
 fun candidates ctxt rigid field T =
   let val thy = Proof_Context.theory_of ctxt in
     lookup (Context.Proof ctxt) field T
-    |> filter (fits thy rigid T o pattern_of)
+    |> map_filter (fn r => if fits thy rigid T (pattern_of r) then SOME (#term r) else NONE)
     |> subsume thy
   end;
 
@@ -485,6 +495,50 @@ fun field_names ctxt rigid T =
     |> filter (fits thy rigid T o pattern_of)
     |> map #field |> sort_distinct string_ord
   end;
+
+
+(* the rule on the candidates U of the object type T *)
+
+datatype decision = Choose of term | Wait | Empty | Ambiguous of term list;
+
+(*T as the check phase fixes it without the field (Proof_Context.prepare_patterns): every
+  inference parameter left in it is a fixed type variable, of the object logic's base sort if it
+  has no sort and a term is read; a pattern keeps the sort*)
+fun fixed_type ctxt T =
+  Logic.dest_type
+    (singleton (Type_Infer.fixate ctxt (Proof_Context.pattern_mode ctxt)) (Logic.mk_type T));
+
+(*the matching candidates of U that no other matching one is more specific than (in the order
+  of U), and those that only unify with T.  One candidate is more specific than another if its
+  pattern is an instance of the other's, not conversely; a matching candidate that another
+  matching one is more specific than can never be chosen, as the other one keeps matching.
+  Of the patterns that no other one is more specific than, one of each class of equal ones is
+  kept, and a candidate is compared with the kept ones: linear in U for a given number of them*)
+fun contenders ctxt T U =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val (matching, others) = List.partition (matches thy (fixed_type ctxt T) o pattern) U;
+    fun add P Ps =
+      if exists (fn Q => matches thy Q P) Ps then Ps
+      else filter_out (matches thy P) Ps @ [P];
+    val unbeaten = fold (add o pattern) matching [];
+  in (filter (fn t => exists (matches thy (pattern t)) unbeaten) matching, others) end;
+
+(*of several candidates the one more specific than every other is chosen, once all of them
+  match T: one that only unifies with T may still come to match or drop out, so the rule waits,
+  unless none of these can come to be more specific than every matching one*)
+fun select _ _ [] = Empty
+  | select _ _ [t] = Choose t
+  | select ctxt T U =
+      (case contenders ctxt T U of
+        ([t], []) => Choose t
+      | ([], _) => Wait
+      | ([_], _) => Wait
+      | (ts, others) =>
+          let
+            val thy = Proof_Context.theory_of ctxt;
+            fun below_all u = forall (fn t => matches thy (pattern u) (pattern t)) ts;
+          in if exists below_all others then Wait else Ambiguous ts end);
 
 
 (* insertion, removal, the declaration *)
@@ -574,63 +628,90 @@ fun check_registration ctxt (field, t) =
 
 (* conflicts of an explicit registration *)
 
-datatype conflict = Same_Pattern | New_Never | Old_Never | Overlap;
+(*Overlap: the common instances of the two patterns*)
+datatype conflict = Same_Pattern | Overlap of typ;
 
+(*against the registrations the rule considers.  One that is more specific or more general than
+  the new one is no conflict; neither is an overlap on whose common instances the rule chooses*)
 fun conflicts ctxt (field, t) =
   let
     val thy = Proof_Context.theory_of ctxt;
-    val P = domain_type (fastype_of t);
-    fun classify (r: registration) =
-      if term_instance thy (t, #term r) orelse term_instance thy (#term r, t) then NONE
+    val P = pattern t;
+    val us = subsume thy (map #term (lookup (Context.Proof ctxt) field P));
+    fun ambiguous T =
+      (case select ctxt T (subsume thy (filter (matches thy T o pattern) (t :: us))) of
+        Ambiguous _ => true
+      | _ => false);
+    fun classify u =
+      if term_instance thy (t, u) orelse term_instance thy (u, t) then NONE
       else
-        let val Q = pattern_of r in
-          if not (fits thy {rigid = K false} P Q) then NONE
-          else
-            (case (fits thy {rigid = K true} P Q, fits thy {rigid = K true} Q P) of
-              (true, true) => SOME Same_Pattern
-            | (true, false) => SOME New_Never
-            | (false, true) => SOME Old_Never
-            | (false, false) => SOME Overlap)
+        let val Q = pattern u in
+          (case (matches thy P Q, matches thy Q P) of
+            (true, true) => SOME Same_Pattern
+          | (false, false) =>
+              (case unifier thy {rigid = K false} P Q of
+                SOME (tyenv, _) =>
+                  let val common = Envir.norm_type tyenv P
+                  in if ambiguous common then SOME (Overlap common) else NONE end
+              | NONE => NONE)
+          | _ => NONE)
         end;
-  in
-    lookup (Context.Proof ctxt) field P
-    |> map_filter (fn r => Option.map (rpair r) (classify r))
-  end;
+  in map_filter (fn u => Option.map (rpair u) (classify u)) us end;
 
-(*errors for the classes that make a registration useless, a warning for an overlap*)
+(*an error for the same pattern, a warning for an overlap*)
 fun report_conflicts ctxt (field, t) =
   let
-    val thy = Proof_Context.theory_of ctxt;
-    val P = domain_type (fastype_of t);
+    val P = pattern t;
     val new = "Field " ^ quote field ^ " of " ^ registered_text ctxt t;
     val dot = quote ("x." ^ field);
-    fun old (r: registration) = "\n  " ^ registered_text ctxt (#term r) ^ "\n";
-    fun text (Same_Pattern, r) =
+    fun old u = "\n  " ^ registered_text ctxt u ^ "\n";
+    fun text (Same_Pattern, u) =
           "Field " ^ quote field ^ " cannot be registered: on every object of type " ^
-          Syntax.string_of_typ ctxt P ^ " it would be ambiguous with" ^ old r ^
+          Syntax.string_of_typ ctxt P ^ " it would be ambiguous with" ^ old u ^
           "Register it under another name, or remove the existing field with dot_field del."
-      | text (New_Never, r) =
-          new ^ " could never be chosen:\nevery object it fits also fits the existing field " ^
-          quote field ^ old r ^ "and " ^ dot ^ " would be ambiguous on these objects."
-      | text (Old_Never, r) =
-          new ^ " would make the existing field " ^ quote field ^ old r ^
-          "impossible to choose: every object it fits also fits the new one."
-      | text (Overlap, r) =
-          let
-            val common =
-              (case unifier thy {rigid = K false} P (pattern_of r) of
-                SOME (tyenv, _) => Envir.norm_type tyenv P
-              | NONE => P);
-          in
-            new ^ " overlaps the existing field " ^ quote field ^ old r ^
-            dot ^ " is ambiguous on objects of type " ^ Syntax.string_of_typ ctxt common ^ "."
-          end;
+      | text (Overlap common, u) =
+          new ^ " overlaps the existing field " ^ quote field ^ old u ^
+          dot ^ " is ambiguous on objects of type " ^ Syntax.string_of_typ ctxt common ^ ".";
     val cs = conflicts ctxt (field, t);
   in
-    (case find_first (fn (c, _) => c <> Overlap) cs of
+    (case find_first (fn (Same_Pattern, _) => true | _ => false) cs of
       SOME c => error (text c)
     | NONE => List.app (warning o text) cs)
   end;
+
+
+
+(** lists in messages **)
+
+(*every list of fields shows at most 5 items*)
+val bound = 5;
+fun bounded xs = (take bound xs, length xs > bound);
+
+(*only the shown items are rendered*)
+fun bounded_lines render xs =
+  let val (shown, more) = bounded xs
+  in map (prefix "  " o render) shown @ (if more then ["  \<dots>"] else []) end;
+
+fun bounded_commas xs =
+  let val (shown, more) = bounded xs
+  in commas shown ^ (if more then ", \<dots>" else "") end;
+
+(*the constant that the field segment shows for the registered term t: its head after folding
+  abbreviations, as printing shows it*)
+fun head_constant ctxt t =
+  (case head_of (Envir.eta_contract (Proof_Context.contract_abbrevs ctxt t)) of
+    Const (c, _) => SOME c
+  | _ => NONE);
+
+(*candidates in the order of their printed names: the head constant (as the field markup), else
+  the printed term*)
+fun sort_candidates ctxt gs =
+  let
+    fun key g =
+      (case head_constant ctxt g of
+        SOME c => Proof_Context.extern_const ctxt c
+      | NONE => Syntax.string_of_term ctxt g);
+  in map (fn g => (key g, g)) gs |> sort (string_ord o apply2 #1) |> map #2 end;
 
 
 
@@ -684,17 +765,50 @@ fun object ctxt segs =
       | _ => NONE);
   in Option.mapPartial reading (const_prefix ctxt 1 segs) end;
 
-(*every way to continue a reading with the field f: the candidates of the selection rule on the
-  type reached so far, each applied to the reading*)
-fun step ctxt f ({t, env, maxidx}: state) =
+(*the type that a reading has reached*)
+fun reached ({t, env, ...}: state) = Envir.norm_type env (fastype_of t);
+
+(*readings that reach the same type, as one: a reading of them, and for each field so far (the
+  last one first) the registered terms that they take for it*)
+type path = state * term list list;
+
+(*the identifier read as field access: each field with the registered terms that the complete
+  readings take for it, complete readings (one of those that reach the same type), and whether
+  readings were left out*)
+type readings = {fields: (string * term list) list, complete: term list, cut: bool};
+
+(*every way to continue the readings with the field f: the candidates that the selection rule
+  does not rule out on the type reached (contenders), each applied*)
+fun step ctxt f =
+  maps (fn (st as {t, env, maxidx}, picks): path =>
+    let
+      val T = reached st;
+      fun apply g =
+        let
+          val g' = Logic.incr_indexes ([], maxidx + 1) g;
+          val st' = {t = g' $ t, env = env, maxidx = Int.max (maxidx, maxidx_of_term g')};
+        in Option.map (rpair ([g] :: picks)) (try (unify ctxt (T, pattern g')) st') end;
+    in map_filter apply (op @ (contenders ctxt T (candidates ctxt {rigid = K false} f T))) end);
+
+(*the readings to continue with the field f: those that reach the same type continue as one,
+  and of the types that f has a candidate for at most bound are followed, so that a chain of
+  fields adds up instead of multiplying.  Also whether a type was left out: then readings are
+  missing, and with them possibly the warning*)
+fun followed ctxt f rs =
   let
-    val T = Envir.norm_type env (fastype_of t);
-    fun apply ({term = g, ...}: registration) =
-      let
-        val g' = Logic.incr_indexes ([], maxidx + 1) g;
-        val st = {t = g' $ t, env = env, maxidx = Int.max (maxidx, maxidx_of_term g')};
-      in try (unify ctxt (T, domain_type (fastype_of g'))) st end;
-  in map_filter apply (candidates ctxt {rigid = K false} f T) end;
+    val thy = Proof_Context.theory_of ctxt;
+    fun same T T' = matches thy T T' andalso matches thy T' T;
+    fun continues T = not (null (candidates ctxt {rigid = K false} f T));
+    fun add (st, picks) (kept, cut) =
+      let val T = reached st in
+        (case find_index (fn (T', _) => same T T') kept of
+          ~1 =>
+            if not (continues T) then (kept, cut)
+            else if length kept = bound then (kept, true)
+            else (kept @ [(T, (st, picks))], cut)
+        | i => (nth_map i (apsnd (apsnd (map2 (union (op aconv)) picks))) kept, cut))
+      end;
+  in apfst (map #2) (fold add rs ([], false)) end;
 
 (*the reading fits the text around the identifier: the types written on it, and the number of
   arguments it is applied to*)
@@ -712,29 +826,60 @@ fun fits_site ctxt ({args, types}: site) (st: state) =
 (*the reading as printed: types normalised, beta-normal*)
 fun reading_term ({t, env, ...}: state) = Envir.beta_norm (Term.map_types (Envir.norm_type env) t);
 
-fun readings ctxt ({name, site, ...}: occurrence) =
+(*the readings of the identifier as field access on a constant that fit the site*)
+fun readings ctxt ({name, site, ...}: occurrence) : readings option =
   (case object ctxt (Long_Name.explode name) of
     SOME (obj, fields) =>
       if forall (defined ctxt) fields then
-        fold (maps o step ctxt) fields [obj] |> filter (fits_site ctxt site) |> map reading_term
-      else []
-  | NONE => []);
+        let
+          val (rs, cut) =
+            fold (fn f => fn (rs, cut) =>
+                followed ctxt f rs |>> step ctxt f ||> (fn cut' => cut orelse cut'))
+              fields ([(obj, [])], false);
+          val complete = filter (fits_site ctxt site o #1) rs;
+        in
+          if null complete then NONE
+          else
+            SOME
+             {fields =
+                fields ~~ rev (fold (map2 (union (op aconv)) o #2) complete (map (K []) fields)),
+              complete = map (reading_term o #1) complete, cut = cut}
+        end
+      else NONE
+  | NONE => NONE);
 
-fun render ctxt ({name, const, pos, ...}: occurrence) ts =
+(*the warning's text; the text of one reading when every field has one term and no reading was
+  left out*)
+fun render ctxt ({name, const, pos, ...}: occurrence) ({fields, complete, cut}: readings) =
   let
     val T = Consts.type_scheme (Proof_Context.consts_of ctxt) const;
-    fun reading t =
-      "  " ^ Syntax.string_of_term ctxt t ^ " :: " ^ Syntax.string_of_typ ctxt (fastype_of t);
+    val print = Syntax.string_of_term ctxt;
+    fun reading t = typed_text ctxt (t, fastype_of t);
+    fun field (f, gs) =
+      let val (shown, more) = bounded (map print (sort_candidates ctxt gs))
+      in "  " ^ quote f ^ ": " ^ commas shown ^ (if more orelse cut then ", \<dots>" else "") end;
+    val keep = "or " ^ quote ("CONST " ^ name) ^ " to keep the constant without this warning.";
+    val body =
+      if forall (fn (_, gs) => length gs = 1) fields andalso not cut then
+        ["It could also be read as field access:", "  " ^ reading (hd complete),
+          "Write that term to mean the field access, " ^ keep]
+      else if length fields = 1 then
+        "It could also be read as field access:" ::
+          bounded_lines reading (sort_candidates ctxt complete) @
+          ["Write one of these terms to mean the field access, " ^ keep]
+      else
+        "It could also be read as field access, each field being one of:" :: map field fields @
+          ["Write the term you mean, for example " ^ quote (print (hd complete)) ^ ", " ^ keep];
   in
     cat_lines
-      ([Markup.markup (Position.markup pos) (quote name) ^ " is read as the constant " ^ const ^
-          " :: " ^ Syntax.string_of_typ ctxt T,
-        "It could also be read as field access:"] @
-       map reading ts @
-       [(if length ts = 1 then "Write that term" else "Write one of these terms") ^
-          " to mean the field access, or CONST " ^ name ^
-          " to keep the constant without this warning."])
+      ((Markup.markup (Position.markup pos) (quote name) ^ " is read as the constant " ^ const ^
+          " :: " ^ Syntax.string_of_typ ctxt T) :: body)
   end;
+
+(*what determines the text: the terms, and readings left out or not*)
+fun same_text (r: readings, r': readings) =
+  #cut r = #cut r' andalso
+  eq_list (op aconv) (maps #2 (#fields r) @ #complete r, maps #2 (#fields r') @ #complete r');
 
 in
 
@@ -746,12 +891,10 @@ fun warning_texts ctxt occs =
   |> distinct (fn (o1: occurrence, o2: occurrence) =>
       #name o1 = #name o2 andalso #site o1 = #site o2)
   |> map_filter (fn occ =>
-      (case the_default [] (try (readings ctxt) occ) of
-        [] => NONE
-      | ts => SOME (occ, ts)))
-  |> distinct (fn ((o1: occurrence, ts1), (o2: occurrence, ts2)) =>
-      #name o1 = #name o2 andalso eq_list (op aconv) (ts1, ts2))
-  |> map_filter (fn (occ, ts) => try (render ctxt occ) ts);
+      Option.map (pair occ) (the_default NONE (try (readings ctxt) occ)))
+  |> distinct (fn ((o1: occurrence, r1), (o2: occurrence, r2)) =>
+      #name o1 = #name o2 andalso same_text (r1, r2))
+  |> map_filter (fn (occ, r) => try (render ctxt occ) r);
 
 fun emit_warnings ctxt occs = List.app warning (warning_texts ctxt occs);
 
@@ -789,8 +932,6 @@ fun access_tr' _ (p :: ts) =
 
 (** selection rule **)
 
-datatype decision = Choose of term | Wait | Empty | Ambiguous of term list;
-
 (*step 1 of the rule: the object type is a type variable that may still be instantiated*)
 fun unknown {rigid} (TVar (xi, _)) = not (rigid xi)
   | unknown _ _ = false;
@@ -798,15 +939,7 @@ fun unknown {rigid} (TVar (xi, _)) = not (rigid xi)
 (*T: the object type, dereferenced by the engine's typing*)
 fun decide ctxt rigid field T =
   if unknown rigid T then Wait
-  else
-    (case candidates ctxt rigid field T of
-      [] => Empty
-    | [r] => Choose (#term r)
-    | U =>
-        let
-          val thy = Proof_Context.theory_of ctxt;
-          val matching = filter (fits thy {rigid = K true} T o pattern_of) U;
-        in if length matching >= 2 then Ambiguous (map #term matching) else Wait end);
+  else select ctxt T (candidates ctxt rigid field T);
 
 
 (* types *)
@@ -893,34 +1026,6 @@ type engine =
   prep_output: typ Vartab.table -> (string * typ) list -> term list -> typ list ->
     term list * typ list};
 
-(*every list of fields shows at most 5 items*)
-fun bounded xs = (take 5 xs, length xs > 5);
-
-fun bounded_lines xs =
-  let val (shown, more) = bounded xs
-  in map (prefix "  ") shown @ (if more then ["  \<dots>"] else []) end;
-
-fun bounded_commas xs =
-  let val (shown, more) = bounded xs
-  in commas shown ^ (if more then ", \<dots>" else "") end;
-
-(*the constant that the field segment shows for the registered term t: its head after folding
-  abbreviations, as printing shows it*)
-fun head_constant ctxt t =
-  (case head_of (Envir.eta_contract (Proof_Context.contract_abbrevs ctxt t)) of
-    Const (c, _) => SOME c
-  | _ => NONE);
-
-(*candidates in the order of their printed names: the head constant (as the field markup), else
-  the printed term*)
-fun sort_candidates ctxt gs =
-  let
-    fun key g =
-      (case head_constant ctxt g of
-        SOME c => Proof_Context.extern_const ctxt c
-      | NONE => Syntax.string_of_term ctxt g);
-  in map (fn g => (key g, g)) gs |> sort (string_ord o apply2 #1) |> map #2 end;
-
 (*the access t as written: the written identifier up to this field, or the object e of a bracket
   form printed by print, and the written fields up to this one*)
 fun written print t =
@@ -963,7 +1068,7 @@ fun field_error_msg ctxt (engine as {rigid, unify, prep_output}: engine) (tye, i
           the_default tye (Option.map #1 (try (unify (objT, domain_type gT)) (tye, idx')));
         val ([t], [R]) = prep_output tye' bs [g' $ obj'] [range_type gT];
       in typed_text ctxt (t, R) end;
-    val candidate_lines = bounded_lines o map cand o sort_candidates ctxt;
+    val candidate_lines = bounded_lines cand o sort_candidates ctxt;
     val ambiguous =
       "Ambiguous field " ^ quote field ^ " of " ^ obj_text ^ " :: " ^ type_text ^ here;
     val T' = norm tye objT;
@@ -990,8 +1095,8 @@ fun field_error_msg ctxt (engine as {rigid, unify, prep_output}: engine) (tye, i
       Ambiguous gs =>
         cat_lines
           ([ambiguous,
-            (if paren then "" else dot ^ " is not a constant, and ") ^ type_text ^ " has " ^
-              string_of_int (length gs) ^ " fields named " ^ quote field ^ ":"] @
+            (if paren then "" else dot ^ " is not a constant, and ") ^ type_text ^
+              " has no most specific field named " ^ quote field ^ ":"] @
            candidate_lines gs @ ["Write one of these terms instead."])
     | Empty =>
         if const_object then constant_object (fields_of ())
@@ -1000,7 +1105,7 @@ fun field_error_msg ctxt (engine as {rigid, unify, prep_output}: engine) (tye, i
             ((dot ^ (if paren then " is not" else " is neither a constant nor") ^ " a field of " ^
               obj_text ^ " :: " ^ type_text ^ here) :: fields_of ())
     | Wait =>
-        let val gs = map #term (candidates ctxt {rigid = rigid} field T') in
+        let val gs = candidates ctxt {rigid = rigid} field T' in
           if unknown {rigid = rigid} T' then
             if const_object andalso null gs then constant_object []
             else
@@ -1013,14 +1118,14 @@ fun field_error_msg ctxt (engine as {rigid, unify, prep_output}: engine) (tye, i
                   (("Field " ^ quote field ^ " of " ^ obj_text ^
                     " cannot be resolved: the type of " ^ obj_text ^ " is unknown" ^ here) ::
                    (if null line2 then [] else [space_implode " " line2]) @
-                   bounded_lines (map (registered_text ctxt) (sort_candidates ctxt gs)))
+                   bounded_lines (registered_text ctxt) (sort_candidates ctxt gs))
               end
           else
             cat_lines
               ([ambiguous,
                 (if paren then "The type of " else dot ^ " is not a constant, and the type of ") ^
                   obj_text ^ " is not determined enough to choose among:"] @
-               candidate_lines gs @
+               candidate_lines (op @ (contenders ctxt T' gs)) @
                ["Write one of these terms instead, or fix the type of " ^ obj_text ^ "."])
         end
     | Choose _ => raise Fail "Dot_Field.field_error_msg")

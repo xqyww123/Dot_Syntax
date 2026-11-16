@@ -69,7 +69,11 @@ r"""val dot_syntax = Config.declare_bool ("dot_syntax", \<^here>) (K false);
 val dot_syntax_warning = Config.declare_bool ("dot_syntax_warning", \<^here>) (K true);""",
 r"""val dot_syntax = Attrib.setup_config_bool \<^binding>\<open>dot_syntax\<close> (K false);
 val dot_syntax_warning = Attrib.setup_config_bool \<^binding>\<open>dot_syntax_warning\<close> (K true);"""),
-  # the loading theory declares the carrier constant (pure_thy.ML)
+  # the loading theory declares the carrier constant, with the type that pure_thy.ML gives it:
+  # read by Simple_Syntax.read_typ, so that its type variables have the empty sort.  (Written as
+  # \<^typ> in a HOL theory they had sort "type", and unifying the carrier's object type with an
+  # object raised every inference parameter of the object's type to that sort: the engines then
+  # saw object types that the product never sees.  Review of proto_specific, 2026-11-15.)
   Edit("dot_field-pure-declarations", DF,
 r"""val access_const = "Pure.dot_access";""",
 r"""val access_const = "Pure.dot_access";
@@ -81,13 +85,19 @@ val _ =
     |> Sign.root_path
     |> Sign.add_consts
         [(Binding.concealed (Binding.qualify true "Pure" (Binding.make ("dot_access", \<^here>))),
-          \<^typ>\<open>'n \<Rightarrow> 'a \<Rightarrow> 'b\<close>, NoSyn)]
+          Simple_Syntax.read_typ "'n \<Rightarrow> 'a \<Rightarrow> 'b", NoSyn)]
     |> Sign.restore_naming thy);"""),
   # stock Proof_Context does not export is_const_declared: its body (proof_context.ML:374-376)
   Edit("dot_field-is-const-declared", DF,
 r"""Proof_Context.is_const_declared ctxt c""",
 r"""(let val space = Proof_Context.const_space ctxt
      in Name_Space.declared space (Name_Space.intern space c) end)"""),
+  # stock Proof_Context does not export pattern_mode (proof_context.ML, next to abbrev_mode; the
+  # file is not loaded in user space).  mode_pattern is the only mode with the pattern flag
+  # (proof_context.ML:244-247, make_mode is not exported), so the test is the same
+  Edit("dot_field-pattern-mode", DF,
+r"""Proof_Context.pattern_mode ctxt""",
+r"""(Proof_Context.get_mode ctxt = Proof_Context.mode_pattern)"""),
   # a copy of Subtyping next to HOL's: its own option and data (userspace_replay)
   # Syntax_Phases.simple_check, which step 2 exports (plan 6.10); the copy's check (the engine,
   # MERGE.md 5 step 9) uses it.  A structure extended by it, before the copy; harmless for stock
@@ -635,6 +645,10 @@ MUTANTS = {
   "blocked_freeze_all": [Edit("blocked_freeze_all", SUB,
 """    (case opened_unify ctxt (U' --> V, T') step (idx + 1) tye of""",
 """    (case (NONE: (typ Vartab.table * int) option) of""")],
+  # D7: a parameter linked to a wildcard through a variable on the wildcard's chain is not frozen
+  "opened_chain_missed": [Edit("opened_chain_missed", SUB,
+"""                    is_wild A orelse member (op =) on_chain xi orelse""",
+"""                    is_wild A orelse""")],
   # deferral: a pass that postponed a re-run reports its failure, or returns its waiting fields
   "deferral_report_failure": [Edit("deferral_report_failure", SUB,
 """      if postponed fs then POSTPONED_FAILURE

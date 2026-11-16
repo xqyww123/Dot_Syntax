@@ -20,6 +20,7 @@ sig
   val get_mode: Proof.context -> mode
   val restore_mode: Proof.context -> Proof.context -> Proof.context
   val abbrev_mode: Proof.context -> bool
+  val pattern_mode: Proof.context -> bool
   val syntax_of: Proof.context -> Syntax.syntax
   val tsig_of: Proof.context -> Type.tsig
   val set_defsort: sort -> Proof.context -> Proof.context
@@ -326,6 +327,7 @@ fun map_cases f =
 val get_mode = #mode o rep_data;
 val restore_mode = set_mode o get_mode;
 val abbrev_mode = get_mode #> (fn Mode {abbrev, ...} => abbrev);
+val pattern_mode = get_mode #> (fn Mode {pattern, ...} => pattern);
 
 val syntax_of = Local_Syntax.syntax_of o #syntax o rep_data;
 val set_syntax_mode = map_syntax o Local_Syntax.set_mode;

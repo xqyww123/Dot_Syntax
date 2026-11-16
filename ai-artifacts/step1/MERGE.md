@@ -26,7 +26,7 @@
 | `src/Pure/Syntax/syntax_phases.ML` | `ast_to_term` 两处、`decode_ident`、警告通道、开关打开时标 `field_dot` 并解析一次与失败时的说明（`field_dots_hint`）、`check` 交回上下文、`check_terms` 出口报告、`pretty_entity_cache` 的 `CONST`、导出 `simple_check`；第 0 级 `"standard"` 改 `term_check'`（r8 起没有 `decode_free`，原版 `decode` 的 Free 分支原样） | 原位 |
 | `src/Pure/Syntax/lexicon.ML`、`parser.ML` | `field_dot` token 与 `field_access_dots`；`Parser.parse` 多一个参数 `{field_dots: bool}`，左递归的 `field_dot` 产生式单独存放、只在后面还有 `field_dot` 时预测（计划 6.3.2） | 原位 |
 | `src/Pure/type_infer_context.ML` | `prepare_positions` 的 `Var` 分支重建载荷；标准引擎（`standard_check`） | 原位 |
-| `src/Pure/Isar/proof_context.ML` | 签名导出 `is_const_declared` | 原位 |
+| `src/Pure/Isar/proof_context.ML` | 签名导出 `is_const_declared`；r11 加访问函数 `pattern_mode`（签名一行、定义一行，写法同原版的 `abbrev_mode`；选择规则判"匹配"时用它，计划 §1 第 30 条） | 原位 |
 | `src/Pure/Isar/attrib.ML` | 登记两个开关（紧挨 `Syntax.ambiguity_warning`） | 原位 |
 | `src/Pure/Syntax/dot_field_attrib.ML`（新） | `dot_field` attribute（`Args.embedded_declaration` + `Scan.state`）；参数只收标识符或长标识符（简写）与 `f = c`，前面可加 `del`，写错时报自定文案（r8，计划 §1 第 26 条 (3)） | `Isar/attrib.ML` 之后 |
 | `src/Pure/ROOT.ML` | 读入上面两个新文件 | — |
@@ -51,6 +51,12 @@
   现算）。`decide` 经 `candidates` 取 U（§6.4："选择、所有报错、警告、冲突检测都从 `Dot_Field.candidates` 取 U"），引擎传入已按自己的 typing 解引用的对象
   类型与 `{rigid = not o Type_Infer.is_param}`；"可合一"与"匹配"同一函数换刚性集合。之后引擎照旧用自己的合一把对象类型细化。顺序照 §1 第 3 条：
   先看类型变量，再看 U 空（INV 0.8；r8 起先测类型变量，之后才算 U）。
+  **r11（"最具体的赢"，计划 §1 第 30 条）：** 规则的函数都收登记的 term，不收整条登记：`pattern t`（对象的类型）、`matches thy T P`、
+  `candidates`（返回 term 列表）、`contenders ctxt T U`（U 里已匹配而没有被别的已匹配候选压过的，与只可合一的；没有被压过的模式类型里相同的只留一个，每个候选
+  只和留下的这些比，最后按 U 的顺序过滤一遍）、`select ctxt T U`（由 `contenders` 得出 `Choose` / `Wait` / `Ambiguous`，`Ambiguous` 带没有被压过的那些）、
+  `decide`（类型未知先等，否则 `select`）。判匹配用 `fixed_type ctxt T`：`Type_Infer.fixate ctxt (Proof_Context.pattern_mode ctxt)` 作用在 T 上，
+  即原版 `prepare_patterns` 对整个 term 做的那一步；U 仍按 T 原样算。`field_error_msg` 的"类型不够明确"列 `contenders` 的两部分。
+  两个引擎只调用 `decide`，没有改。
 - **文案**：错误文案只接收已由调用方的 `prep_output` 处理过的类型，所以 Dot_Field 不复制 `prep_output`（各引擎用自己的那份，含 2026 的 `Name.clean`）。
   五条上限与省略号、空列表时省去那一行（"Fields of …" 与 "Fields named … exist for:" 都省）、括号形式省去 `"c.xpos" is not a constant` 半句、写出的前缀
   是常量时的变体，都在这次补上；措辞全部列入 6.6 的文案过目。候选行按全名排序，截到前 5 条。
@@ -70,6 +76,12 @@
   context 里都是固定变量）与第八轮的遮蔽规则（与被遮住的 theory 副本相同的 theory 副本也遮住）。`defined` 只看可见的登记。读法：
   `Syntax.parse_term` 后去掉位置与类型约束，必须是 `Const`（含缩写；`c :: T` 也算常量），再 `check_term` 加 `Variable.polymorphic`，只读一遍（位置
   只报告一次）。简写 `[[dot_field c]]` 的字段名取所写文本的最后一段（§6.4 原文）。删除写法 `[[dot_field del f = c]]`、`[[dot_field del c]]`（`Args.del`；已定）。
+  **r11：** `subsume` 收 term 列表，只在"β-η 收缩后抹掉类型相同"的 term 之间比较（类型实例与原 term 只差类型）；`conflicts` 返回
+  `(conflict * term) list`，`datatype conflict = Same_Pattern | Overlap of typ`（带两者的公共实例）：模式类型相同报错；有交集、谁也不比谁更具体、
+  而且 `select` 在公共实例上对"已有的加新的"确实给出 `Ambiguous` 时警告；新登记更具体或更一般不算冲突。
+- **长标识符的警告（r11）**：`step` 取 `contenders` 的候选；`followed ctxt f` 把到达同一类型的读法并成一个（带着各段取过的 term 的并集），去掉
+  下一个字段 `f` 没有候选的类型，再最多跟 `bound`（5）个；`readings` 返回 `{fields, complete, cut}`（每个字段在走得通的完整读法上取过的 term、
+  完整读法、是否丢过读法）；`render` 三种格式（一个读法；一个字段多个读法；多个字段每个一行）。
   r8 起参数在 attribute 解析时只收两种写法（简写的 `c` 是标识符或长标识符 token，`f = c` 的 `c` 可带类型），其余报自定文案（计划 §1 第 26 条 (3)，文案列入 6.6 过目）。
   冲突：按同一关系分类并报告（错误还是警告列入文案过目，先按登记设计 §7.1 的提议）。
 
@@ -109,7 +121,12 @@
 10. `CONST` 打印。测：直接调用、V_Attack E01–E03 的读回。
 11. attrib.ML、ROOT.ML、record.ML 的那几行（用户空间没有作用，第二步实测）。
 
-用户空间的替身（6.12 那张表之外）：开关由 setup 登记；载体常量写在测试 theory 里；`is_const_declared`、`simple_check` 在副本里另写；HOL 里调
+**用户空间的替身必须与产品行为相同**（2026-11-15 的教训，计划 §1 第 30 条"测试环境的改正"）：载体常量曾在 HOL 的 theory 里用 `\<^typ>` 声明，
+类型变量成了 sort `type`，而产品是空 sort，测试因此看到了产品看不到的对象类型；现在用 `Simple_Syntax.read_typ` 声明，与 `pure_thy.ML` 相同。
+加一条替身之前先问：它会不会改变选择、规则、警告或消息的结果。其余已知的差别（打印器不加 `CONST`、检查的级别、只测了 HOL）列在
+`proto_specific/review/recheck_judgment.md` 第 5 节。
+用户空间的替身（6.12 那张表之外）：开关由 setup 登记；载体常量写在加载它的 theory 里（声明同产品）；`is_const_declared`、`simple_check` 在副本里另写；
+`Proof_Context.pattern_mode ctxt` 换成 `(Proof_Context.get_mode ctxt = Proof_Context.mode_pattern)`（`mode_pattern` 是唯一带 pattern 标志的 mode）；HOL 里调
 `Term_Position` 的翻译编译在补过的副本上；coercion 副本另有自己的开关（`edits.py` 的 `subtyping-no-check` 让副本借 HOL 的开关，学习运行关不掉它，
 INV 0.12）；副本里 `ML_check_strings` 的 legacy 警告不管（Pure 的引导文件不受它影响）。
 
